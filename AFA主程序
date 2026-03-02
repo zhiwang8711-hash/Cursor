@@ -107,8 +107,13 @@ class AFAQuantSystem:
         print("\n[Layer 3] 个股结构评分...")
 
         # 计算综合评分 (先计算，不加分)
+        score_adjustment = {
+            **risk_adjustment,
+            'market_regime': market_regime,
+            'emotion_index': emotion_index,
+        }
         scored_df = self.alpha_strategy.calculate_comprehensive_score(
-            limit_up_df, risk_adjustment
+            limit_up_df, score_adjustment
         )
 
         # 添加主线加分 (在有综合评分后再加分)
@@ -120,6 +125,11 @@ class AFAQuantSystem:
         # 应用高度限制
         scored_df = self.alpha_strategy.select_with_height_limit(
             scored_df, risk_adjustment['max_height']
+        )
+
+        # 应用市场状态动态过滤（含可交易性约束）
+        scored_df = self.alpha_strategy.apply_dynamic_filter(
+            scored_df, market_regime
         )
 
         # 打印评分分布
