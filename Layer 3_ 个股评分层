@@ -1,0 +1,392 @@
+"""
+AFA 量化框架 - Layer 3: 个股结构层 (Alpha策略)
+===============================================
+核心选股因子设计与评分系统
+
+核心功能:
+- 连板高度价值函数 (高斯函数)
+- 龙头辨识度指数
+- 动态换手率评分 (Z-Score)
+- 综合评分系统
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+
+from config import STOCK_SCORING_CONFIG
+from data_loader import DataLoader
+from utils import gaussian_value, z_score_normalize, calculate_atr, get_historical_mode
+
+
+class AlphaStrategy:
+    """
+    Alpha 选股策略器
+    ==================
+
+    核心评分:
+    1. Height_Value: 连板高度价值 (高斯函数)
+    2. Leader_Index: 龙头辨识度
+    3. Turnover_Z: 动态换手率评分
+
+    最终评分:
+    综合评分 = 基础分 + 各因子加权
+    """
+
+    def __init__(self, data_loader: Optional[DataLoader] = None):
+        self.config = STOCK_SCORING_CONFIG
+        self.data_loader = data_loader or DataLoader()
+
+        # 历史数据缓存
+        self.height_history = defaultdict(list)
+
+    def calculate_height_value(
+        self,
+        current_height: int,
+        historical_heights: Optional[List[int]] = None
+    ) -> float:
+        """
+        计算连板高度价值 (高斯函数)
+
+        参数:
+            current_height: 当前连板数
+            historical_heights: 历史连板数据 (用于计算主升高度)
+
+        返回:
+            高度价值 (0-1)
+        """
+        sigma = self.config['height_value']['sigma']
+
+        # 计算主升高度 (众数)
+        if historical_heights:
+            main_height = get_historical_mode(pd.Series(historical_heights), 60)
+        else:
+            main_height = 3  # 默认3板
+
+        # 高斯函数计算价值
+        value = gaussian_value(current_height, main_height, sigma)
+
+        return value
+
+    def calculate_leader_index(
+        self,
+        stock_code: str,
+        limit_up_amount: float,
+        total_amount: float,
+        lhb_institutions: int = 0,
+        follow_stocks: int = 0
+    ) -> float:
+        """
+        计算龙头辨识度指数
+
+        参数:
+            stock_code: 股票代码
+            limit_up_amount: 封单金额
+            total_amount: 成交额
+            lhb_institutions: 龙虎榜机构数
+            follow_stocks: 板块内跟风涨停股数量
+
+        返回:
+            龙头辨识度 (0-100)
+        """
+        weights = self.config['leader_index']
+
+        # 封单占比
+        seal_ratio = (limit_up_amount / total_amount * 100) if total_amount > 0 else 0
+
+        # 计算指数
+        leader_index = (
+            weights['seal_order_weight'] * seal_ratio +
+            weights['lhb_inst_weight'] * lhb_institutions +
+            weights['follow_stock_weight'] * follow_stocks
+        )
+
+        return leader_index
+
+    def calculate_turnover_zscore(
+        self,
+        stock_turnover: float,
+        sector_avg_turnover: float,
+        sector_std_turnover: float
+    ) -> float:
+        """
+        计算换手率Z-Score
+
+        参数:
+            stock_turnover: 个股换手率
+            sector_avg_turnover: 板块平均换手率
+            sector_std_turnover: 板块换手率标准差
+
+        返回:
+            Z-Score (-3 到 3)
+        """
+        if sector_std_turnover == 0:
+            return 0
+
+        z_score = (stock_turnover - sector_avg_turnover) / sector_std_turnover
+
+        # 限制范围
+        return np.clip(z_score, -3, 3)
+
+    def score_turnover(
+        self,
+        z_score: float
+    ) -> float:
+        """
+        根据Z-Score评分
+
+        最佳区间: -0.5 到 0.5 (与板块平均接近)
+        过低: 无人关注
+        过高: 换手过旺
+
+        返回:
+            评分 (0-100)
+        """
+        # U型评分: 中等换手最好
+        if -0.5 <= z_score <= 0.5:
+            return 100
+        elif -1.0 <= z_score < -0.5:
+            return 80
+        elif 0.5 < z_score <= 1.0:
+            return 80
+        elif -1.5 <= z_score < -1.0:
+            return 60
+        elif 1.0 < z_score <= 1.5:
+            return 60
+        else:
+            return 40
+
+    def calculate_comprehensive_score(
+        self,
+        df: pd.DataFrame,
+        market_adjustment: Optional[Dict] = None
+    ) -> pd.DataFrame:
+        """
+        计算综合评分
+
+        参数:
+            df: 股票 DataFrame
+            market_adjustment: 市场调整参数
+
+        返回:
+            带评分的 DataFrame
+        """
+        if df.empty:
+            return df
+
+        df = df.copy()
+
+        # 初始化评分列
+        df['基础分'] = 50.0
+
+        # 1. 连板高度价值
+        if '连板数' in df.columns:
+            df['高度价值分'] = df['连板数'].apply(
+                lambda x: self.calculate_height_value(int(x)) * 100 if pd.notna(x) else 50.0
+            )
+        else:
+            df['高度价值分'] = 50.0
+
+        # 2. 换手率评分
+        if '换手率' in df.columns:
+            # 简化版: 基于换手率区间评分
+            df['换手率分'] = df['换手率'].apply(self._score_turnover_range)
+        else:
+            df['换手率分'] = 50.0
+
+        # 3. 价格评分 (U型: 中价股最好)
+        if '现价' in df.columns:
+            df['价格分'] = df['现价'].apply(self._score_price_range)
+        else:
+            df['价格分'] = 50.0
+
+        # 4. 成交额评分
+        if '成交额' in df.columns:
+            df['成交额分'] = df['成交额'].apply(self._score_amount_range)
+        else:
+            df['成交额分'] = 50.0
+
+        # 5. 一字板加分
+        if '是否一字板' in df.columns or '涨跌幅' in df.columns:
+            df['一字板分'] = df.apply(self._score_ziban, axis=1)
+        else:
+            df['一字板分'] = 50.0
+
+        # 计算综合评分
+        weights = {
+            '基础分': 0.30,
+            '高度价值分': 0.25,
+            '换手率分': 0.15,
+            '价格分': 0.10,
+            '成交额分': 0.10,
+            '一字板分': 0.10,
+        }
+
+        df['综合评分'] = sum(
+            df[col] * weight for col, weight in weights.items()
+        )
+
+        # 应用市场调整
+        if market_adjustment:
+            alpha = market_adjustment.get('alpha_multiplier', 1.0)
+            df['综合评分'] = df['综合评分'] * alpha
+
+        # 添加主线加分
+        if '主线加分' in df.columns:
+            df['综合评分'] = df['综合评分'] + df['主线加分'].fillna(0)
+
+        return df
+
+    def _score_turnover_range(self, turnover: float) -> float:
+        """
+        换手率评分 (U型: 3-15%最优)
+        """
+        if pd.isna(turnover):
+            return 50
+
+        if 3 <= turnover <= 15:
+            return 100
+        elif turnover < 3:
+            return 50 + turnover / 3 * 50
+        elif turnover <= 30:
+            return 100 - (turnover - 15) / 15 * 30
+        else:
+            return 20
+
+    def _score_price_range(self, price: float) -> float:
+        """
+        价格评分 (U型: 10-50元最优)
+        """
+        if pd.isna(price):
+            return 50
+
+        if 10 <= price <= 50:
+            return 100
+        elif price < 10:
+            return 50 + price / 10 * 50
+        elif price <= 100:
+            return 100 - (price - 50) / 50 * 30
+        else:
+            return 40
+
+    def _score_amount_range(self, amount: float) -> float:
+        """
+        成交额评分 (适中最好)
+        """
+        if pd.isna(amount) or amount <= 0:
+            return 50
+
+        # 1-5亿最优
+        if 1e8 <= amount <= 5e8:
+            return 100
+        elif amount < 1e8:
+            return 50 + (amount / 1e8) * 50
+        elif amount <= 1e9:
+            return 100 - (amount - 5e8) / 5e8 * 20
+        else:
+            return 60
+
+    def _score_ziban(self, row: pd.Series) -> float:
+        """
+        一字板评分
+        """
+        # 判断是否为一字板 (最高价=收盘价=开盘价, 且涨幅接近涨停)
+        if '涨跌幅' in row:
+            change = row['涨跌幅']
+            if change > 9.5:  # 接近涨停
+                return 80  # 一字板加分
+        return 50
+
+    def rank_stocks(
+        self,
+        df: pd.DataFrame,
+        top_n: int = 10
+    ) -> pd.DataFrame:
+        """
+        排名选股
+
+        参数:
+            df: 带评分的 DataFrame
+            top_n: 选取数量
+
+        返回:
+            Top股票
+        """
+        if df.empty:
+            return df
+
+        # 按综合评分排序
+        df_sorted = df.sort_values('综合评分', ascending=False)
+
+        return df_sorted.head(top_n)
+
+    def select_with_height_limit(
+        self,
+        df: pd.DataFrame,
+        max_height: int
+    ) -> pd.DataFrame:
+        """
+        根据最大高度限制筛选
+
+        参数:
+            df: 股票 DataFrame
+            max_height: 最大允许连板数
+
+        返回:
+            筛选后的 DataFrame
+        """
+        if df.empty:
+            return df
+
+        if '连板数' not in df.columns:
+            return df
+
+        # 保留 <= max_height 的股票
+        return df[df['连板数'] <= max_height].copy()
+
+    def apply_dynamic_filter(
+        self,
+        df: pd.DataFrame,
+        market_regime: str
+    ) -> pd.DataFrame:
+        """
+        应用动态过滤条件
+
+        参数:
+            df: 股票 DataFrame
+            market_regime: 市场状态
+
+        返回:
+            过滤后的 DataFrame
+        """
+        if df.empty:
+            return df
+
+        df_filtered = df.copy()
+
+        # 根据市场状态调整
+        if market_regime == 'strong':
+            # 强趋势: 放宽条件
+            pass
+        elif market_regime == 'neutral':
+            # 中性: 标准条件
+            pass
+        else:  # weak
+            # 退潮: 严格条件
+            # 只保留综合评分>=60的
+            df_filtered = df_filtered[df_filtered['综合评分'] >= 60]
+
+        return df_filtered
+
+
+if __name__ == "__main__":
+    print("Testing AlphaStrategy...")
+
+    strategy = AlphaStrategy()
+
+    # 测试高度价值
+    # value = strategy.calculate_height_value(3, [1,2,3,2,3,4,3,2,3])
+    # print(f"Height value: {value}")
+
+    print("AlphaStrategy test completed")

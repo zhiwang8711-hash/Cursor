@@ -1,0 +1,419 @@
+"""
+AFA 量化框架 - Layer 4: 博弈价值与风控层
+=========================================
+核心功能:
+- 预期收益计算 (胜率×盈亏比)
+- 动态仓位管理
+- 止损/止盈策略
+- 连续亏损控制
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+from collections import deque
+from datetime import datetime
+
+from config import GAME_VALUE_CONFIG, RISK_CONTROL_CONFIG
+from utils import calculate_win_rate, calculate_profit_loss_ratio
+
+
+class RiskManager:
+    """
+    风控与博弈价值管理器
+    ====================
+
+    核心功能:
+    1. Expected_Return 预期收益 = 连板成功概率 * 平均涨幅 - 失败概率 * 平均跌幅
+    2. Kelly仓位管理
+    3. 动态止损 (ATR或固定百分比)
+    4. 连续亏损控制
+    """
+
+    def __init__(self):
+        self.game_config = GAME_VALUE_CONFIG
+        self.risk_config = RISK_CONTROL_CONFIG
+
+        # 交易历史
+        self.trade_history = []
+        self.position_history = deque(maxlen=10)  # 最近10个交易日
+        self.daily_pnl = deque(maxlen=10)  # 最近10日盈亏
+
+    def calculate_expected_return(
+        self,
+        height: int,
+        historical_success_rates: Dict[int, float],
+        historical_profits: Dict[int, float],
+        historical_losses: Dict[int, float]
+    ) -> float:
+        """
+        计算预期收益
+
+        参数:
+            height: 当前连板高度
+            historical_success_rates: {高度: 历史成功率}
+            historical_profits: {高度: 平均盈利幅度}
+            historical_losses: {高度: 平均亏损幅度}
+
+        返回:
+            预期收益 (正值可参与)
+        """
+        # 获取该高度的历史数据
+        success_rate = historical_success_rates.get(height, 0.3)  # 默认30%
+        avg_profit = historical_profits.get(height, 0.10)  # 默认10%
+        avg_loss = historical_losses.get(height, 0.05)  # 默认5%
+
+        # 计算预期收益
+        fail_rate = 1 - success_rate
+        expected_return = success_rate * avg_profit - fail_rate * avg_loss
+
+        return expected_return
+
+    def calculate_profit_loss_ratio(
+        self,
+        height: int,
+        historical_profits: Dict[int, float],
+        historical_losses: Dict[int, float]
+    ) -> float:
+        """
+        计算盈亏比
+
+        参数:
+            height: 当前连板高度
+            historical_profits: {高度: 平均盈利幅度}
+            historical_losses: {高度: 平均亏损幅度}
+
+        返回:
+            盈亏比
+        """
+        avg_profit = historical_profits.get(height, 0.10)
+        avg_loss = abs(historical_losses.get(height, 0.05))
+
+        if avg_loss == 0:
+            return 0
+
+        return avg_profit / avg_loss
+
+    def filter_by_expected_return(
+        self,
+        df: pd.DataFrame,
+        historical_data: Optional[Dict] = None
+    ) -> pd.DataFrame:
+        """
+        过滤预期收益为正的股票
+
+        参数:
+            df: 股票 DataFrame
+            historical_data: 历史统计数据
+
+        返回:
+            过滤后的 DataFrame
+        """
+        if df.empty:
+            return df
+
+        # 默认历史数据
+        if historical_data is None:
+            historical_data = {
+                'success_rates': {1: 0.45, 2: 0.30, 3: 0.20, 4: 0.15, 5: 0.10},
+                'avg_profits': {1: 0.05, 2: 0.08, 3: 0.12, 4: 0.15, 5: 0.20},
+                'avg_losses': {1: 0.03, 2: 0.04, 3: 0.05, 4: 0.06, 5: 0.08},
+            }
+
+        min_expected = self.game_config['min_expected_return']
+        min_ratio = self.game_config['min_profit_loss_ratio']
+
+        valid_indices = []
+
+        for idx, row in df.iterrows():
+            height = row.get('连板数', 1)
+
+            # 计算预期收益
+            exp_ret = self.calculate_expected_return(
+                height,
+                historical_data['success_rates'],
+                historical_data['avg_profits'],
+                historical_data['avg_losses']
+            )
+
+            # 计算盈亏比
+            pnl_ratio = self.calculate_profit_loss_ratio(
+                height,
+                historical_data['avg_profits'],
+                historical_data['avg_losses']
+            )
+
+            # 筛选条件
+            if exp_ret >= min_expected and pnl_ratio >= min_ratio:
+                valid_indices.append(idx)
+
+        return df.loc[valid_indices].copy()
+
+    def calculate_position_size(
+        self,
+        stock_score: float,
+        market_regime: str,
+        max_position: float = 0.2
+    ) -> float:
+        """
+        计算仓位大小
+
+        参数:
+            stock_score: 股票评分 (0-100)
+            market_regime: 市场状态
+            max_position: 最大单股仓位
+
+        返回:
+            建议仓位 (0-1)
+        """
+        # 基础仓位 = 评分/100 * 最大仓位
+        base_position = (stock_score / 100) * max_position
+
+        # 市场状态调整
+        regime_multipliers = {
+            'strong': 1.0,
+            'neutral': 0.7,
+            'weak': 0.3,
+        }
+        multiplier = regime_multipliers.get(market_regime, 0.5)
+
+        # Kelly 简化版
+        position = base_position * multiplier
+
+        return min(position, max_position)
+
+    def check_stop_loss(
+        self,
+        current_price: float,
+        entry_price: float,
+        stop_loss_pct: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """
+        检查是否触发止损
+
+        参数:
+            current_price: 当前价格
+            entry_price: 买入价格
+            stop_loss_pct: 止损百分比 (默认配置)
+
+        返回:
+            (是否止损, 原因)
+        """
+        if stop_loss_pct is None:
+            stop_loss_pct = self.risk_config['stop_loss_pct']
+
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        if pnl_pct <= stop_loss_pct:
+            return True, f"触发止损: {pnl_pct:.1%} <= {stop_loss_pct:.1%}"
+
+        return False, ""
+
+    def check_take_profit(
+        self,
+        current_price: float,
+        entry_price: float,
+        take_profit_pct: float = 0.10
+    ) -> Tuple[bool, str]:
+        """
+        检查是否触发止盈
+
+        参数:
+            current_price: 当前价格
+            entry_price: 买入价格
+            take_profit_pct: 止盈百分比
+
+        返回:
+            (是否止盈, 原因)
+        """
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        if pnl_pct >= take_profit_pct:
+            return True, f"触发止盈: {pnl_pct:.1%} >= {take_profit_pct:.1%}"
+
+        return False, ""
+
+    def check_consecutive_losses(self) -> Tuple[bool, str]:
+        """
+        检查连续亏损
+
+        返回:
+            (是否需要控制, 原因)
+        """
+        threshold = self.risk_config['consecutive_loss_threshold']
+        stop_threshold = self.risk_config['consecutive_loss_stop']
+
+        if len(self.daily_pnl) < threshold:
+            return False, ""
+
+        # 统计连续亏损天数
+        consecutive_days = 0
+        for pnl in reversed(self.daily_pnl):
+            if pnl < 0:
+                consecutive_days += 1
+            else:
+                break
+
+        if consecutive_days >= stop_threshold:
+            return True, f"连续{consecutive_days}日亏损，停止交易"
+        elif consecutive_days >= threshold:
+            return True, f"连续{consecutive_days}日亏损，减半仓位"
+
+        return False, ""
+
+    def calculate_kelly_position(
+        self,
+        win_rate: float,
+        profit_loss_ratio: float,
+        max_position: float = 0.2
+    ) -> float:
+        """
+        Kelly公式计算仓位
+
+        Kelly% = W - (1-W) / R
+
+        参数:
+            win_rate: 胜率
+            profit_loss_ratio: 盈亏比
+            max_position: 最大仓位限制
+
+        返回:
+            建议仓位
+        """
+        if profit_loss_ratio == 0:
+            return 0
+
+        kelly = win_rate - (1 - win_rate) / profit_loss_ratio
+
+        # 减半Kelly (保守)
+        kelly = kelly / 2
+
+        # 限制范围
+        kelly = max(0, min(kelly, max_position))
+
+        return kelly
+
+    def record_trade(
+        self,
+        stock_code: str,
+        entry_price: float,
+        exit_price: Optional[float] = None,
+        position_size: float = 0,
+        entry_date: str = "",
+        exit_date: str = ""
+    ):
+        """
+        记录交易
+
+        参数:
+            stock_code: 股票代码
+            entry_price: 买入价格
+            exit_price: 卖出价格 (可选)
+            position_size: 仓位
+            entry_date: 买入日期
+            exit_date: 卖出日期
+        """
+        trade = {
+            'stock_code': stock_code,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'position_size': position_size,
+            'entry_date': entry_date,
+            'exit_date': exit_date,
+            'pnl_pct': None,
+        }
+
+        if exit_price:
+            trade['pnl_pct'] = (exit_price - entry_price) / entry_price
+
+        self.trade_history.append(trade)
+
+    def record_daily_pnl(self, date: str, pnl: float):
+        """
+        记录每日盈亏
+
+        参数:
+            date: 日期
+            pnl: 盈亏金额
+        """
+        self.daily_pnl.append(pnl)
+        self.position_history.append({
+            'date': date,
+            'pnl': pnl,
+        })
+
+    def get_trade_statistics(self) -> Dict:
+        """
+        获取交易统计
+
+        返回:
+            统计字典
+        """
+        if not self.trade_history:
+            return {
+                'total_trades': 0,
+                'win_rate': 0,
+                'profit_loss_ratio': 0,
+                'avg_profit': 0,
+                'avg_loss': 0,
+            }
+
+        closed_trades = [t for t in self.trade_history if t['pnl_pct'] is not None]
+
+        if not closed_trades:
+            return {'total_trades': len(self.trade_history), 'closed_trades': 0}
+
+        wins = [t['pnl_pct'] for t in closed_trades if t['pnl_pct'] > 0]
+        losses = [t['pnl_pct'] for t in closed_trades if t['pnl_pct'] < 0]
+
+        win_rate = len(wins) / len(closed_trades) if closed_trades else 0
+        avg_profit = np.mean(wins) if wins else 0
+        avg_loss = np.mean(losses) if losses else 0
+        pnl_ratio = abs(avg_profit / avg_loss) if avg_loss != 0 else 0
+
+        return {
+            'total_trades': len(self.trade_history),
+            'closed_trades': len(closed_trades),
+            'win_rate': win_rate,
+            'profit_loss_ratio': pnl_ratio,
+            'avg_profit': avg_profit,
+            'avg_loss': avg_loss,
+        }
+
+    def should_trade(self, market_regime: str) -> Tuple[bool, str]:
+        """
+        判断是否应该交易
+
+        参数:
+            market_regime: 市场状态
+
+        返回:
+            (是否交易, 原因)
+        """
+        # 1. 检查连续亏损
+        should_stop, reason = self.check_consecutive_losses()
+        if should_stop:
+            return False, reason
+
+        # 2. 检查市场状态
+        if market_regime == 'weak':
+            return False, "市场退潮，暂停交易"
+
+        return True, ""
+
+
+if __name__ == "__main__":
+    print("Testing RiskManager...")
+
+    manager = RiskManager()
+
+    # 测试预期收益计算
+    # exp_ret = manager.calculate_expected_return(
+    #     3,
+    #     {1: 0.45, 2: 0.30, 3: 0.20},
+    #     {1: 0.05, 2: 0.08, 3: 0.12},
+    #     {1: 0.03, 2: 0.04, 0.05}
+    # )
+    # print(f"Expected return: {exp_ret:.3f}")
+
+    print("RiskManager test completed")

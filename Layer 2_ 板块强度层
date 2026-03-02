@@ -1,0 +1,373 @@
+"""
+AFA 量化框架 - Layer 2: 板块强度层 (主线聚类)
+==============================================
+动态识别资金抱团的主线板块
+
+核心功能:
+- Sector_Strength 板块强度计算
+- 主线板块动态识别
+- Top3 板块筛选与权重加成
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+
+from config import SECTOR_STRENGTH_CONFIG
+from data_loader import DataLoader
+from utils import z_score_normalize, calculate_rps
+
+
+class SectorStrengthAnalyzer:
+    """
+    板块强度分析器
+    ==================
+
+    Sector_Strength 计算公式:
+        2 * 当日涨停数
+      + 3 * 连板数
+      + 2 * 20cm数量
+      + 平均涨幅
+      - 1.5 * 炸板率
+
+    输出:
+        - Top3 板块列表
+        - 各板块强度分数
+        - 主线板块权重加成
+    """
+
+    def __init__(self, data_loader: Optional[DataLoader] = None):
+        self.config = SECTOR_STRENGTH_CONFIG
+        self.data_loader = data_loader or DataLoader()
+
+        # 板块强度历史
+        self.sector_history = defaultdict(list)
+
+    def calculate_sector_strength(
+        self,
+        limit_up_df: pd.DataFrame,
+        broken_df: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """
+        计算各板块强度
+
+        参数:
+            limit_up_df: 涨停池 DataFrame
+            broken_df: 炸板池 DataFrame
+
+        返回:
+            板块强度 DataFrame
+        """
+        if limit_up_df.empty:
+            return pd.DataFrame()
+
+        # 按概念/行业分组
+        if '所属行业' in limit_up_df.columns:
+            sector_col = '所属行业'
+        elif '所属板块' in limit_up_df.columns:
+            sector_col = '所属板块'
+        elif '行业' in limit_up_df.columns:
+            sector_col = '行业'
+        else:
+            return pd.DataFrame()
+
+        sectors = defaultdict(lambda: {
+            'limit_up_count': 0,
+            'continuation_count': 0,
+            'twenty_cm_count': 0,
+            'total_change': 0,
+            'stocks': [],
+        })
+
+        # 统计各板块数据
+        for _, row in limit_up_df.iterrows():
+            sector = row.get(sector_col, '未知')
+            if pd.isna(sector):
+                continue
+
+            sectors[sector]['limit_up_count'] += 1
+            sectors[sector]['stocks'].append(row)
+
+            # 连板数
+            if '连板数' in row:
+                cont = row['连板数']
+                if cont >= 2:
+                    sectors[sector]['continuation_count'] += 1
+
+            # 20cm (涨幅>18%)
+            if '涨跌幅' in row and row['涨跌幅'] > 18:
+                sectors[sector]['twenty_cm_count'] += 1
+
+            # 累计涨幅
+            if '涨跌幅' in row:
+                sectors[sector]['total_change'] += row['涨跌幅']
+
+        # 计算炸板率
+        broken_rates = {}
+        if broken_df is not None and not broken_df.empty:
+            broken_by_sector = broken_df.groupby(sector_col).size()
+            for sector in sectors:
+                broken = broken_by_sector.get(sector, 0)
+                total = sectors[sector]['limit_up_count'] + broken
+                broken_rates[sector] = broken / total if total > 0 else 0
+
+        # 计算强度分数
+        weights = self.config['weights']
+        results = []
+
+        for sector, data in sectors.items():
+            limit_up_count = data['limit_up_count']
+            continuation_count = data['continuation_count']
+            twenty_cm_count = data['twenty_cm_count']
+            avg_change = data['total_change'] / limit_up_count if limit_up_count > 0 else 0
+            broken_rate = broken_rates.get(sector, 0)
+
+            # 计算强度分数
+            strength = (
+                weights['limit_up_count'] * limit_up_count +
+                weights['continuation_count'] * continuation_count +
+                weights['twenty_cm_count'] * twenty_cm_count +
+                weights['avg_change'] * avg_change -
+                weights['broken_rate_penalty'] * broken_rate * 100
+            )
+
+            results.append({
+                'sector': sector,
+                'limit_up_count': limit_up_count,
+                'continuation_count': continuation_count,
+                'twenty_cm_count': twenty_cm_count,
+                'avg_change': avg_change,
+                'broken_rate': broken_rate,
+                'strength': strength,
+                'stocks': data['stocks'],
+            })
+
+        # 排序
+        df = pd.DataFrame(results)
+        if not df.empty:
+            df = df.sort_values('strength', ascending=False).reset_index(drop=True)
+
+        return df
+
+    def get_top_sectors(
+        self,
+        limit_up_df: pd.DataFrame,
+        broken_df: Optional[pd.DataFrame] = None,
+        top_n: Optional[int] = None
+    ) -> List[str]:
+        """
+        获取Top主线板块
+
+        参数:
+            limit_up_df: 涨停池
+            broken_df: 炸板池
+            top_n: 返回数量 (默认配置)
+
+        返回:
+            主线板块列表
+        """
+        top_n = top_n or self.config['top_n_sectors']
+        min_count = self.config['min_limit_up_count']
+
+        # 计算强度
+        strength_df = self.calculate_sector_strength(limit_up_df, broken_df)
+
+        if strength_df.empty:
+            return []
+
+        # 筛选涨停数>=门槛的板块
+        valid_sectors = strength_df[
+            strength_df['limit_up_count'] >= min_count
+        ].head(top_n)
+
+        return valid_sectors['sector'].tolist()
+
+    def get_sector_weights(
+        self,
+        limit_up_df: pd.DataFrame,
+        broken_df: Optional[pd.DataFrame] = None
+    ) -> Dict[str, float]:
+        """
+        获取板块权重加成
+
+        参数:
+            limit_up_df: 涨停池
+            broken_df: 炸板池
+
+        返回:
+            {板块名: 权重加成}
+        """
+        top_n = self.config['top_n_sectors']
+        sectors = self.get_top_sectors(limit_up_df, broken_df, top_n)
+
+        # Top板块给1.0权重，其他给0.5
+        weights = {}
+        for i, sector in enumerate(sectors):
+            # 排名越前权重越高
+            weights[sector] = 1.0 - (i * 0.2)  # 1.0, 0.8, 0.6
+
+        return weights
+
+    def is_mainline_sector(self, sector: str, mainline_sectors: List[str]) -> bool:
+        """
+        判断是否为主线板块
+
+        参数:
+            sector: 板块名
+            mainline_sectors: 主线板块列表
+
+        返回:
+            是否主线
+        """
+        return sector in mainline_sectors
+
+    def filter_by_mainline(
+        self,
+        df: pd.DataFrame,
+        mainline_sectors: List[str],
+        sector_col: str = '所属板块'
+    ) -> pd.DataFrame:
+        """
+        过滤保留主线板块的股票
+
+        参数:
+            df: 股票 DataFrame
+            mainline_sectors: 主线板块列表
+            sector_col: 板块列名
+
+        返回:
+            过滤后的 DataFrame
+        """
+        if df.empty or not mainline_sectors:
+            return df
+
+        # 保留主线板块
+        return df[df[sector_col].isin(mainline_sectors)].copy()
+
+    def add_sector_bonus(
+        self,
+        df: pd.DataFrame,
+        mainline_sectors: List[str],
+        sector_col: str = None,
+        bonus: float = 15.0
+    ) -> pd.DataFrame:
+        """
+        为主线板块股票添加分数加成
+
+        参数:
+            df: 股票 DataFrame
+            mainline_sectors: 主线板块列表
+            sector_col: 板块列名 (自动检测)
+            bonus: 加成分数
+
+        返回:
+            添加加分后的 DataFrame
+        """
+        if df.empty or '综合评分' not in df.columns:
+            return df
+
+        # 自动检测板块列
+        if sector_col is None:
+            if '所属行业' in df.columns:
+                sector_col = '所属行业'
+            elif '所属板块' in df.columns:
+                sector_col = '所属板块'
+            elif '行业' in df.columns:
+                sector_col = '行业'
+            else:
+                return df
+
+        if sector_col not in df.columns:
+            return df
+
+        df = df.copy()
+
+        # 初始化主线加分列
+        df['主线加分'] = 0.0
+
+        # 为主线板块添加加分
+        mask = df[sector_col].isin(mainline_sectors)
+        df.loc[mask, '主线加分'] = bonus
+
+        # 更新总分
+        df['综合评分'] = df['综合评分'] + df['主线加分']
+
+        return df
+
+    def get_sector_summary(
+        self,
+        limit_up_df: pd.DataFrame,
+        broken_df: Optional[pd.DataFrame] = None
+    ) -> Dict:
+        """
+        获取板块强度摘要
+
+        参数:
+            limit_up_df: 涨停池
+            broken_df: 炸板池
+
+        返回:
+            板块摘要字典
+        """
+        strength_df = self.calculate_sector_strength(limit_up_df, broken_df)
+
+        if strength_df.empty:
+            return {
+                'top_sectors': [],
+                'total_sectors': 0,
+                'weights': {},
+            }
+
+        top_n = self.config['top_n_sectors']
+        top_sectors = strength_df.head(top_n)['sector'].tolist()
+
+        # 权重
+        weights = self.get_sector_weights(limit_up_df, broken_df)
+
+        return {
+            'top_sectors': top_sectors,
+            'total_sectors': len(strength_df),
+            'strength_df': strength_df,
+            'weights': weights,
+            'mainline_bonus': 15,
+        }
+
+    def detect_sector_momentum(
+        self,
+        concept_board: pd.DataFrame,
+        lookback: int = 20
+    ) -> pd.DataFrame:
+        """
+        检测板块动量 (RPS)
+
+        参数:
+            concept_board: 概念板块行情
+            lookback: 回看天数
+
+        返回:
+            带RPS分数的板块DataFrame
+        """
+        if concept_board.empty or '板块代码' not in concept_board.columns:
+            return concept_board
+
+        # 计算涨跌幅RPS
+        if '涨跌幅' in concept_board.columns:
+            returns = concept_board['涨跌幅'] / 100
+            concept_board['RPS'] = calculate_rps(returns, lookback)
+
+        return concept_board
+
+
+if __name__ == "__main__":
+    print("Testing SectorStrengthAnalyzer...")
+
+    analyzer = SectorStrengthAnalyzer()
+
+    # 测试
+    # limit_up_df = loader.get_limit_up_pool("20260227")
+    # broken_df = loader.get_broken_board_pool("20260227")
+    # summary = analyzer.get_sector_summary(limit_up_df, broken_df)
+    # print(f"Top sectors: {summary['top_sectors']}")
+
+    print("SectorStrengthAnalyzer test completed")

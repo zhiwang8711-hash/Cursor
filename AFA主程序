@@ -1,0 +1,290 @@
+"""
+AFA (Alpha-Flow Adaptive) 量化策略框架
+========================================
+主程序入口
+
+版本: V1.0
+功能: 情绪驱动 + 主线聚类 + 胜率×盈亏比优化 + 动态风控
+
+使用方式:
+    python main.py                    # 运行今日选股
+    python main.py --backtest          # 运行回测
+    python main.py --date 20260227    # 指定日期选股
+"""
+
+import sys
+import os
+import argparse
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+# 添加项目根目录到路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 导入各层模块
+from config import BACKTEST_CONFIG
+from data_loader import DataLoader
+from market_regime import MarketRegimeDetector
+from sector_cluster import SectorStrengthAnalyzer
+from alpha_strategy import AlphaStrategy
+from risk_manager import RiskManager
+from backtest_engine import BacktestEngine
+
+
+class AFAQuantSystem:
+    """
+    AFA 量化系统主类
+    ==================
+
+    整合所有层的功能，提供统一的选股接口
+    """
+
+    def __init__(self):
+        # 初始化各层
+        self.data_loader = DataLoader()
+        self.market_detector = MarketRegimeDetector(self.data_loader)
+        self.sector_analyzer = SectorStrengthAnalyzer(self.data_loader)
+        self.alpha_strategy = AlphaStrategy(self.data_loader)
+        self.risk_manager = RiskManager()
+        self.backtest_engine = BacktestEngine()
+
+    def run_daily_selection(self, date: str) -> Dict:
+        """
+        运行每日选股
+
+        参数:
+            date: 日期 (YYYYMMDD 或 YYYY-MM-DD)
+
+        返回:
+            选股结果字典
+        """
+        print(f"\n{'='*60}")
+        print(f"AFA 量化选股系统 - {date}")
+        print(f"{'='*60}\n")
+
+        # 标准化日期
+        if '-' in date:
+            date_str = date.replace('-', '')
+        else:
+            date_str = date
+
+        # ========== Layer 0: 数据加载与清洗 ==========
+        print("[Layer 0] 数据加载与清洗...")
+        limit_up_df = self.data_loader.get_limit_up_pool(date_str)
+        broken_df = self.data_loader.get_broken_board_pool(date_str)
+        market_breadth = self.data_loader.get_market_breadth(date_str)
+
+        print(f"  涨停池: {len(limit_up_df)} 只")
+        print(f"  炸板池: {len(broken_df)} 只")
+
+        if limit_up_df.empty:
+            print("  警告: 今日无涨停股票")
+            return {'stocks': [], 'date': date}
+
+        # ========== Layer 1: 市场状态检测 ==========
+        print("\n[Layer 1] 市场状态检测...")
+        emotion_index = self.market_detector.calculate_emotion_index(date_str)
+        market_regime = self.market_detector.get_market_regime()
+        risk_adjustment = self.market_detector.get_risk_adjustment()
+
+        print(f"  情绪指数: {emotion_index:.3f}")
+        print(f"  市场状态: {market_regime}")
+        print(f"  仓位限制: {risk_adjustment['max_position']:.0%}")
+        print(f"  最大高度: {risk_adjustment['max_height']} 板")
+
+        # ========== Layer 2: 板块强度识别 ==========
+        print("\n[Layer 2] 板块强度识别...")
+        sector_summary = self.sector_analyzer.get_sector_summary(
+            limit_up_df, broken_df
+        )
+        mainline_sectors = sector_summary['top_sectors']
+        mainline_bonus = sector_summary.get('mainline_bonus', 15.0)
+
+        print(f"  主线板块: {mainline_sectors}")
+
+        # ========== Layer 3: 个股结构评分 ==========
+        print("\n[Layer 3] 个股结构评分...")
+
+        # 计算综合评分 (先计算，不加分)
+        scored_df = self.alpha_strategy.calculate_comprehensive_score(
+            limit_up_df, risk_adjustment
+        )
+
+        # 添加主线加分 (在有综合评分后再加分)
+        if mainline_sectors:
+            scored_df = self.sector_analyzer.add_sector_bonus(
+                scored_df, mainline_sectors, bonus=mainline_bonus
+            )
+
+        # 应用高度限制
+        scored_df = self.alpha_strategy.select_with_height_limit(
+            scored_df, risk_adjustment['max_height']
+        )
+
+        # 打印评分分布
+        if not scored_df.empty and '综合评分' in scored_df.columns:
+            print(f"  评分分布: 最高={scored_df['综合评分'].max():.1f}, "
+                  f"最低={scored_df['综合评分'].min():.1f}, "
+                  f"平均={scored_df['综合评分'].mean():.1f}")
+
+        # 排名选股
+        top_stocks = self.alpha_strategy.rank_stocks(scored_df, top_n=10)
+
+        print(f"  候选股票: {len(top_stocks)} 只")
+
+        # ========== Layer 4: 博弈价值与风控 ==========
+        print("\n[Layer 4] 博弈价值与风控...")
+
+        # 过滤预期收益为正的股票
+        filtered_df = self.risk_manager.filter_by_expected_return(top_stocks)
+
+        # 检查是否应该交易
+        should_trade, trade_reason = self.risk_manager.should_trade(market_regime)
+
+        if not should_trade:
+            print(f"  警告: {trade_reason}")
+            return {
+                'stocks': [],
+                'date': date,
+                'market_regime': market_regime,
+                'reason': trade_reason,
+            }
+
+        # 计算仓位
+        for idx in filtered_df.index:
+            stock = filtered_df.loc[idx]
+            position = self.risk_manager.calculate_position_size(
+                stock['综合评分'], market_regime
+            )
+            filtered_df.loc[idx, '建议仓位'] = position
+
+        # ========== 输出结果 ==========
+        print("\n" + "="*60)
+        print("选股结果")
+        print("="*60)
+
+        results = []
+        for i, (idx, stock) in enumerate(filtered_df.head(5).iterrows(), 1):
+            code = stock.get('代码', stock.get('股票代码', 'N/A'))
+            name = stock.get('名称', stock.get('股票名称', 'N/A'))
+            sector = stock.get('所属行业', stock.get('所属板块', 'N/A'))
+            score = stock.get('综合评分', 0)
+            position = stock.get('建议仓位', 0)
+
+            print(f"{i}. {name}({code}) - {sector}")
+            print(f"   评分: {score:.1f} | 仓位: {position:.0%}")
+
+            results.append({
+                'rank': i,
+                'code': code,
+                'name': name,
+                'sector': sector,
+                'score': score,
+                'position': position,
+            })
+
+        return {
+            'date': date,
+            'market_regime': market_regime,
+            'emotion_index': emotion_index,
+            'mainline_sectors': mainline_sectors,
+            'stocks': results,
+        }
+
+    def run_backtest(self, start_date: str, end_date: str) -> Dict:
+        """
+        运行回测
+
+        参数:
+            start_date: 开始日期
+            end_date: 结束日期
+
+        返回:
+            回测结果
+        """
+        print(f"\n{'='*60}")
+        print(f"AFA 回测系统 - {start_date} ~ {end_date}")
+        print(f"{'='*60}\n")
+
+        # 生成交易日
+        dates = pd.date_range(start=start_date, end=end_date, freq='B')
+        date_strs = [d.strftime('%Y%m%d') for d in dates]
+
+        # 收集信号
+        all_signals = []
+
+        for date_str in date_strs:
+            try:
+                result = self.run_daily_selection(date_str)
+
+                if result['stocks']:
+                    for stock in result['stocks']:
+                        all_signals.append({
+                            'date': date_str,
+                            'stock_code': stock['code'],
+                            'score': stock['score'],
+                        })
+            except Exception as e:
+                print(f"  警告: {date_str} 处理失败: {e}")
+                continue
+
+        # 转换为DataFrame
+        signals_df = pd.DataFrame(all_signals)
+
+        if signals_df.empty:
+            print("警告: 无有效信号")
+            return {}
+
+        # 运行回测
+        print("\n开始回测...")
+
+        # 简化: 使用dummy价格函数
+        def get_close_price(code, date):
+            return 10.0  # 简化
+
+        def get_market_state(date):
+            return 'neutral'
+
+        results = self.backtest_engine.run_backtest(
+            signals_df,
+            get_market_state,
+            get_close_price,
+            start_date,
+            end_date
+        )
+
+        # 输出结果
+        self.backtest_engine.print_performance()
+
+        return results
+
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(description='AFA 量化选股系统')
+    parser.add_argument('--date', type=str, default=None,
+                       help='选股日期 (YYYYMMDD)')
+    parser.add_argument('--backtest', action='store_true',
+                       help='运行回测')
+    parser.add_argument('--start', type=str, default='20240101',
+                       help='回测开始日期')
+    parser.add_argument('--end', type=str, default='20241231',
+                       help='回测结束日期')
+
+    args = parser.parse_args()
+
+    # 创建系统
+    system = AFAQuantSystem()
+
+    if args.backtest:
+        # 运行回测
+        system.run_backtest(args.start, args.end)
+    else:
+        # 每日选股
+        date = args.date or datetime.now().strftime('%Y%m%d')
+        system.run_daily_selection(date)
+
+
+if __name__ == "__main__":
+    main()
