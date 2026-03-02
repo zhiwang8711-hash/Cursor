@@ -1,0 +1,166 @@
+---
+AIGC:
+    ContentProducer: Minimax Agent AI
+    ContentPropagator: Minimax Agent AI
+    Label: AIGC
+    ProduceID: fa71e72b9631254bf1d97de28577e48b
+    PropagateID: fa71e72b9631254bf1d97de28577e48b
+    ReservedCode1: 3046022100d050a7dd98a1919b74b3bc57156c9597e1547421c55c57c3112fd861f6fd16d6022100b9fc11b14088a225338ee5dc89381589809ccfe57f2e718bce2ecfd024e449a6
+    ReservedCode2: 3045022030c62ce45aa88db01af1caea7b77b9ce7031a5f7021e51c04848b5f63eca1c09022100e556863f5994dc759e00fc2448b39691c8bfdbb9f4cae5a56c66e35bff2c9bf9
+---
+
+# AFA 量化选股框架
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/akshare-latest-green.svg" alt="akshare">
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+</p>
+
+AFA (Alpha-Flow Adaptive) 量化选股系统 - 基于情绪驱动 + 主线聚类 + 胜率×盈亏比优化 + 动态风控的A股量化交易框架。
+
+## 功能特性
+
+- **Layer 0: 数据清洗** - ST股票剔除、成交额过滤、异常值处理
+- **Layer 1: 市场状态检测** - Emotion_Index情绪指数，动态判断强趋势/中性/退潮
+- **Layer 2: 板块强度识别** - 涨停数×2 + 连板数×3 + 20cm×2，智能识别主线板块
+- **Layer 3: 个股结构评分** - 高斯高度价值函数，多维度综合评分
+- **Layer 4: 风控博弈** - Kelly仓位公式、动态止损、连续亏损控制
+
+## 系统架构
+
+```
+AFA_Quant_Framework/
+├── config.py              # 全局配置
+├── utils.py              # 工具函数
+├── data_loader.py        # Layer 0: 数据加载与清洗
+├── market_regime.py      # Layer 1: 市场状态检测
+├── sector_cluster.py      # Layer 2: 板块强度识别
+├── alpha_strategy.py     # Layer 3: 个股结构评分
+├── risk_manager.py       # Layer 4: 风控博弈
+├── backtest_engine.py   # 回测引擎
+└── main.py              # 主程序入口
+```
+
+## 安装
+
+```bash
+# 克隆项目
+git clone https://github.com/yourusername/AFA_Quant_Framework.git
+cd AFA_Quant_Framework
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+## 快速开始
+
+```bash
+# 今日选股
+python main.py
+
+# 指定日期选股
+python main.py --date 20260228
+
+# 运行回测
+python main.py --backtest --start 20240101 --end 20241231
+```
+
+## 选股结果示例
+
+```
+============================================================
+AFA 量化选股系统 - 20260228
+============================================================
+
+[Layer 0] 数据加载与清洗...
+  涨停池: 69 只
+  炸板池: 0 只
+
+[Layer 1] 市场状态检测...
+  情绪指数: 0.500
+  市场状态: neutral
+  仓位限制: 50%
+  最大高度: 3 板
+
+[Layer 2] 板块强度识别...
+  主线板块: ['电力', '小金属', '软件开发']
+
+[Layer 3] 个股结构评分...
+  评分分布: 最高=69.6, 最低=38.9, 平均=48.8
+  候选股票: 10 只
+
+[Layer 4] 博弈价值与风控...
+
+============================================================
+选股结果
+============================================================
+1. 格尔软件(603232) - 软件开发
+   评分: 59.3 | 仓位: 8%
+2. 普元信息(688118) - 软件开发
+   评分: 59.3 | 仓位: 8%
+3. 闽东电力(000993) - 电力
+   评分: 59.3 | 仓位: 8%
+4. 宝武镁业(002182) - 小金属
+   评分: 58.8 | 仓位: 8%
+5. 金现代(300830) - 软件开发
+   评分: 56.9 | 仓位: 8%
+```
+
+## 核心算法
+
+### Emotion_Index 情绪指数
+
+```
+Emotion_Index = 0.3 × 涨停溢价率(标准化)
+              + 0.3 × 连板晋级率(标准化)
+              - 0.2 × 跌停变化率(标准化)
+              + 0.2 × 北向资金(标准化)
+```
+
+### 板块强度公式
+
+```
+强度 = 2 × 涨停数 + 3 × 连板数 + 2 × 20cm数量 + 平均涨幅 - 1.5 × 炸板率
+```
+
+### 高斯高度价值函数
+
+```
+f(h) = exp(-(h - h_optimal)² / (2σ²))
+```
+
+### Kelly 仓位公式
+
+```
+Kelly% = W - (1-W) / R
+其中 W = 胜率, R = 盈亏比
+```
+
+## 配置说明
+
+所有配置参数在 `config.py` 中定义：
+
+- `MARKET_REGIME_CONFIG` - 市场状态参数
+- `SECTOR_STRENGTH_CONFIG` - 板块强度权重
+- `STOCK_SCORING_CONFIG` - 个股评分参数
+- `RISK_CONTROL_CONFIG` - 风控参数
+- `BACKTEST_CONFIG` - 回测参数
+
+## 数据来源
+
+- [AKShare](https://akshare.akfamily.xyz/) - A股数据接口
+
+## 注意事项
+
+1. 本框架仅供学习研究，不构成投资建议
+2. 实盘交易前请充分回测验证
+3. 市场有风险，投资需谨慎
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 许可证
+
+MIT License

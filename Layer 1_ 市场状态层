@@ -1,0 +1,322 @@
+"""
+AFA 量化框架 - Layer 1: 市场状态层 (情绪驱动)
+=============================================
+基于多维度自适应指标判断市场状态
+
+核心功能:
+- Emotion_Index 情绪指数计算
+- 市场状态分类 (强趋势/中性/退潮)
+- 动态仓位控制
+- 动态连板高度限制
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Optional, Tuple
+from collections import deque
+
+from config import MARKET_REGIME_CONFIG
+from data_loader import DataLoader
+from utils import z_score_normalize, minmax_normalize, adaptive_threshold
+
+
+class MarketRegimeDetector:
+    """
+    市场状态检测器
+    ==================
+
+    Emotion_Index 计算公式:
+        0.3 * 昨日涨停溢价率 (标准化)
+      + 0.3 * 连板晋级率 (标准化)
+      - 0.2 * 跌停家数变化率 (标准化)
+      + 0.2 * 北向资金净流向 (标准化)
+
+    输出:
+        - strong: Emotion_Index > 0.6
+        - neutral: 0.3 < Emotion_Index <= 0.6
+        - weak: Emotion_Index <= 0.3
+    """
+
+    def __init__(self, data_loader: Optional[DataLoader] = None):
+        self.config = MARKET_REGIME_CONFIG
+        self.data_loader = data_loader or DataLoader()
+
+        # 历史数据缓存
+        self.history = {
+            'limit_up_premium': deque(maxlen=60),
+            'continuation_rate': deque(maxlen=60),
+            'limit_down_change': deque(maxlen=60),
+            'northbound_flow': deque(maxlen=60),
+        }
+
+        # 当前状态
+        self.current_regime = 'neutral'
+        self.current_emotion_index = 0.5
+
+    def calculate_emotion_index(self, current_date: str, lookback_days: int = 20) -> float:
+        """
+        计算情绪指数
+
+        参数:
+            current_date: 当前日期
+            lookback_days: 回看天数
+
+        返回:
+            Emotion_Index (0-1)
+        """
+        # 获取各项指标
+        limit_up_premium = self._get_limit_up_premium(current_date)
+        continuation_rate = self._get_continuation_rate(current_date)
+        limit_down_change = self._get_limit_down_change(current_date)
+        northbound_flow = self._get_northbound_flow(current_date)
+
+        # 更新历史
+        self.history['limit_up_premium'].append(limit_up_premium)
+        self.history['continuation_rate'].append(continuation_rate)
+        self.history['limit_down_change'].append(limit_down_change)
+        self.history['northbound_flow'].append(northbound_flow)
+
+        # 标准化各项指标
+        limit_up_z = self._standardize(limit_up_premium, 'limit_up_premium')
+        continuation_z = self._standardize(continuation_rate, 'continuation_rate')
+        limit_down_z = self._standardize(-limit_down_change, 'limit_down_change')  # 跌停增加是负面的
+        northbound_z = self._standardize(northbound_flow, 'northbound_flow')
+
+        # 计算情绪指数
+        emotion_index = (
+            0.3 * limit_up_z +
+            0.3 * continuation_z +
+            (-0.2) * limit_down_z +
+            0.2 * northbound_z
+        )
+
+        # 归一化到0-1
+        emotion_index = (emotion_index + 1) / 2
+        emotion_index = np.clip(emotion_index, 0, 1)
+
+        self.current_emotion_index = emotion_index
+
+        return emotion_index
+
+    def _standardize(self, value: float, metric_name: str) -> float:
+        """
+        使用Z-Score标准化
+
+        参数:
+            value: 当前值
+            metric_name: 指标名称
+
+        返回:
+            标准化后的值
+        """
+        history = list(self.history.get(metric_name, deque([value])))
+
+        if len(history) < 2:
+            return 0
+
+        mean = np.mean(history)
+        std = np.std(history)
+
+        if std == 0:
+            return 0
+
+        return (value - mean) / std
+
+    def _get_limit_up_premium(self, date: str) -> float:
+        """
+        获取昨日涨停溢价率
+
+        涨停溢价率 = (今日涨停股平均收益 - 市场平均收益) / 市场平均收益
+
+        这里简化为: 涨停股数量 / 市场总成交额占比
+        """
+        try:
+            limit_up_df = self.data_loader.get_limit_up_pool(date)
+            if limit_up_df.empty:
+                return 0
+
+            # 计算涨停股平均涨幅
+            if '涨跌幅' in limit_up_df.columns:
+                return limit_up_df['涨跌幅'].mean() / 100  # 转换为小数
+            return 0.09  # 默认9%
+        except:
+            return 0.09
+
+    def _get_continuation_rate(self, date: str) -> float:
+        """
+        获取连板晋级率
+
+        晋级率 = 2连板以上数量 / 昨日涨停数量
+        """
+        try:
+            limit_up_df = self.data_loader.get_limit_up_pool(date)
+            if limit_up_df.empty:
+                return 0
+
+            # 计算连板率
+            if '连板数' in limit_up_df.columns:
+                # 2连板及以上
+                continuation = len(limit_up_df[limit_up_df['连板数'] >= 2])
+                total = len(limit_up_df)
+                return continuation / total if total > 0 else 0
+            return 0.13  # 默认13%
+        except:
+            return 0.13
+
+    def _get_limit_down_change(self, date: str) -> float:
+        """
+        获取跌停家数变化率
+
+        (今日跌停 - 昨日跌停) / 昨日跌停
+        """
+        try:
+            limit_down_df = self.data_loader.get_limit_down_pool(date)
+            if limit_down_df.empty:
+                return 0
+
+            current_count = len(limit_down_df)
+
+            # 获取昨日数据
+            import datetime
+            dt = datetime.datetime.strptime(date, '%Y%m%d')
+            yesterday = (dt - datetime.timedelta(days=1)).strftime('%Y%m%d')
+
+            yesterday_df = self.data_loader.get_limit_down_pool(yesterday)
+            yesterday_count = len(yesterday_df) if not yesterday_df.empty else 0
+
+            if yesterday_count == 0:
+                return 0
+
+            return (current_count - yesterday_count) / yesterday_count
+        except:
+            return 0
+
+    def _get_northbound_flow(self, date: str) -> float:
+        """
+        获取北向资金净流向
+        """
+        try:
+            flow = self.data_loader.get_northbound_flow(date)
+            return flow.get('净流入', 0) / 1e9  # 转换为十亿
+        except:
+            return 0
+
+    def get_market_regime(self) -> str:
+        """
+        获取市场状态
+
+        返回:
+            'strong' (强趋势) / 'neutral' (中性) / 'weak' (退潮)
+        """
+        thresholds = self.config['regime_thresholds']
+
+        if self.current_emotion_index > thresholds['strong']:
+            self.current_regime = 'strong'
+        elif self.current_emotion_index > thresholds['neutral']:
+            self.current_regime = 'neutral'
+        else:
+            self.current_regime = 'weak'
+
+        return self.current_regime
+
+    def get_position_limit(self) -> float:
+        """
+        获取仓位限制
+
+        根据市场状态返回仓位比例
+        """
+        regime = self.get_market_regime()
+        return self.config['position_by_regime'].get(regime, 0.5)
+
+    def get_max_height_limit(self) -> int:
+        """
+        获取最大连板高度限制
+
+        根据市场状态返回允许的最大连板数
+        """
+        regime = self.get_market_regime()
+        return self.config['max_height_by_regime'].get(regime, 3)
+
+    def get_risk_adjustment(self) -> Dict:
+        """
+        获取风险调整参数
+
+        返回:
+            风险调整字典
+        """
+        regime = self.get_market_regime()
+        emotion = self.current_emotion_index
+
+        # 计算各种调整因子
+        adjustment = {
+            'alpha_multiplier': 1.0 if regime == 'strong' else 0.7,
+            'chase_tolerance': 1.0 if regime == 'strong' else 0.5,
+            'stop_loss_width': 0.08 if regime == 'strong' else 0.05,
+            'max_position': self.get_position_limit(),
+            'max_height': self.get_max_height_limit(),
+        }
+
+        return adjustment
+
+    def get_market_summary(self, date: str) -> Dict:
+        """
+        获取市场状态摘要
+
+        参数:
+            date: 日期
+
+        返回:
+            市场状态字典
+        """
+        emotion = self.calculate_emotion_index(date)
+        regime = self.get_market_regime()
+        adjustment = self.get_risk_adjustment()
+
+        return {
+            'date': date,
+            'emotion_index': emotion,
+            'regime': regime,
+            'position_limit': adjustment['max_position'],
+            'max_height': adjustment['max_height'],
+            'alpha_multiplier': adjustment['alpha_multiplier'],
+            'chase_tolerance': adjustment['chase_tolerance'],
+        }
+
+    def calculate_adaptive_threshold(
+        self,
+        metric_name: str,
+        current_value: float,
+        method: str = 'z_score'
+    ) -> Tuple[bool, str]:
+        """
+        计算自适应阈值判断
+
+        参数:
+            metric_name: 指标名称
+            current_value: 当前值
+            method: 标准化方法
+
+        返回:
+            (是否异常, 异常原因)
+        """
+        threshold = self.config.get('zscore_threshold', 1.5)
+        z_value = self._standardize(current_value, metric_name)
+
+        if abs(z_value) > threshold:
+            return True, f"{metric_name} 超过{threshold}σ阈值"
+        return False, ""
+
+
+if __name__ == "__main__":
+    print("Testing MarketRegimeDetector...")
+
+    # 测试
+    detector = MarketRegimeDetector()
+
+    # 模拟计算
+    # emotion = detector.calculate_emotion_index("20260227")
+    # regime = detector.get_market_regime()
+    # print(f"Emotion Index: {emotion:.3f}")
+    # print(f"Regime: {regime}")
+
+    print("MarketRegimeDetector test completed")

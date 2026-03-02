@@ -1,0 +1,113 @@
+"""
+AFA (Alpha-Flow Adaptive) 量化策略框架
+========================================
+A股量化交易框架 - 情绪驱动 + 主线聚类 + 胜率×盈亏比优化 + 动态风控
+
+版本: V1.0
+作者: AFA Quant Team
+"""
+
+import os
+
+# ==================== 路径配置 ====================
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+CACHE_DIR = os.path.join(DATA_DIR, 'cache')
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
+
+# 创建必要目录
+for d in [DATA_DIR, CACHE_DIR, OUTPUT_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# ==================== 回测参数 ====================
+BACKTEST_CONFIG = {
+    'start_date': '2023-01-01',
+    'end_date': '2025-12-31',
+    'initial_capital': 1_000_000,  # 初始资金100万
+    'commission_rate': 0.001,  # 双边千分之一
+    'slippage': 0.002,  # 滑点0.2%
+    'position_limit': 5,  # 最多持仓5只
+}
+
+# ==================== Layer 0: 数据清洗参数 ====================
+DATA_CLEAN_CONFIG = {
+    'min_trade_amount': 200_000_000,  # 最小成交额2亿
+    'min_listed_days': 60,  # 最小上市天数
+    'max_turnover': 60,  # 最大换手率60%
+    'exclude_st': True,  # 剔除ST
+    'exclude_suspended': True,  # 剔除停牌
+    'outlier_sigma': 3,  # 3σ去极值
+}
+
+# ==================== Layer 1: 市场状态参数 ====================
+MARKET_REGIME_CONFIG = {
+    'lookback_window': 20,  # 计算历史窗口
+    'zscore_threshold': 1.5,  # Z-score阈值
+    'regime_thresholds': {
+        'strong': 0.6,  # 强趋势
+        'neutral': 0.3,  # 中性
+    },
+    'position_by_regime': {
+        'strong': 1.0,  # 强趋势满仓
+        'neutral': 0.5,  # 中性半仓
+        'weak': 0.0,  # 退潮空仓
+    },
+    'max_height_by_regime': {
+        'strong': 7,  # 强趋势允许7板
+        'neutral': 3,  # 中性允许3板
+        'weak': 1,  # 退潮只做1板
+    },
+}
+
+# ==================== Layer 2: 板块强度参数 ====================
+SECTOR_STRENGTH_CONFIG = {
+    'top_n_sectors': 3,  # 只允许Top3板块
+    'weights': {
+        'limit_up_count': 2,  # 涨停数权重
+        'continuation_count': 3,  # 连板数权重
+        'twenty_cm_count': 2,  # 20cm数量权重
+        'avg_change': 1,  # 平均涨幅权重
+        'broken_rate_penalty': 1.5,  # 炸板率惩罚
+    },
+    'min_sector_stocks': 3,  # 板块最小股票数
+    'min_limit_up_count': 2,  # 板块最小涨停数
+}
+
+# ==================== Layer 3: 个股结构参数 ====================
+STOCK_SCORING_CONFIG = {
+    # 连板高度价值函数
+    'height_value': {
+        'sigma': 1.5,  # 高斯函数σ
+    },
+    # 龙头辨识
+    'leader_index': {
+        'seal_order_weight': 1.0,  # 封单金额权重
+        'lhb_inst_weight': 5.0,  # 龙虎榜机构数权重
+        'follow_stock_weight': 3.0,  # 跟风股数量权重
+    },
+    # 动态换手率评分
+    'turnover_zscore_window': 20,  # Z-score计算窗口
+}
+
+# ==================== Layer 4: 博弈价值参数 ====================
+GAME_VALUE_CONFIG = {
+    'min_expected_return': 0,  # 最小预期收益>0
+    'min_profit_loss_ratio': 1.5,  # 最小盈亏比
+    'atr_multiplier': 3,  # ATR倍数计算压力位
+    'stop_loss_atr': 2,  # 止损ATR倍数
+}
+
+# ==================== 风控参数 ====================
+RISK_CONTROL_CONFIG = {
+    'max_position_per_stock': 0.2,  # 单股最大仓位20%
+    'stop_loss_pct': -0.08,  # 单股止损-8%
+    'consecutive_loss_threshold': 3,  # 连续3日亏损减半
+    'consecutive_loss_stop': 5,  # 连续5日亏损停止交易
+    'max_drawdown_stop': -0.15,  # 最大回撤-15%停止
+}
+
+# ==================== AKShare 数据配置 ====================
+AKSHARE_CONFIG = {
+    'use_cache': True,
+    'cache_expire_days': 1,  # 缓存过期天数
+}
